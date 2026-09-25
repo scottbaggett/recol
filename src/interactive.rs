@@ -54,6 +54,8 @@ struct State {
     /// Minimum number of visible rows to keep above/below the selection.
     scrolloff: usize,
     current_theme: Option<String>,
+    /// Theme names from the favourites file, mirrored for the ★ marker.
+    favourites: Vec<String>,
     // last_char: Option<char>,
     adjust: Vec<ThemeAdjustment>,
     adjust_input_buf: String,
@@ -453,6 +455,7 @@ fn draw_screen(s: &State) -> io::Result<()> {
                     ("s / r", "Shuffle / Reverse order"),
                     ("d / l", "Dark / Light only"),
                     ("h", "Recently applied (history)"),
+                    ("F", "Favourites only"),
                     ("Space", "Reset filters (show all)"),
                 ],
             ),
@@ -460,6 +463,7 @@ fn draw_screen(s: &State) -> io::Result<()> {
                 "GENERAL",
                 &[
                     ("Enter", "Apply theme"),
+                    ("m", "Toggle favourite (★)"),
                     ("?", "Open this help"),
                     ("q / Ctrl+c", "Quit"),
                 ],
@@ -568,7 +572,12 @@ fn draw_screen(s: &State) -> io::Result<()> {
 
     for (row_idx, theme) in s.list.iter().skip(s.list_offset).enumerate() {
         let mut row_text = format!(
-            " {}  {}",
+            "{}{}  {}",
+            if s.favourites.iter().any(|n| n == theme.name) {
+                "★"
+            } else {
+                " "
+            },
             if theme.is_light { "☀" } else { "⏾" },
             theme.name
         );
@@ -641,31 +650,68 @@ fn draw_screen(s: &State) -> io::Result<()> {
     stdout.flush()
 }
 
+/// Path named by `RECOL_FAVOURITES_FILE`, if any. The file need not exist yet: it is
+/// created when a theme is favourited.
+fn favourites_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("RECOL_FAVOURITES_FILE").map(std::path::PathBuf::from)
+}
+
+/// Theme names listed in the favourites file, in file order. `None` when no
+/// usable file is configured, which is what makes the list fall back to the
+/// full collection.
+fn favourite_names() -> Option<Vec<String>> {
+    let path = favourites_path().filter(|p| p.is_file())?;
+    let content = std::fs::read_to_string(path).ok()?;
+    Some(
+        content
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// Resolve names to themes, falling back to a fuzzy match so a hand-written
+/// file does not have to spell every name exactly.
+fn resolve_names(names: &[String], args: &Args) -> Vec<lib::LazyTheme> {
+    let mut collection = lib::Collection::new();
+    let filters = args.theme_filters();
+    names
+        .iter()
+        .filter_map(|l| {
+            collection
+                .find(|t| t.name == *l)
+                .or(collection.fuzzy_search(l, &filters, None))
+        })
+        .collect()
+}
+
+/// Add or remove `name` in the favourites file, keeping `favourites` in sync.
+/// A no-op when `RECOL_FAVOURITES_FILE` is unset.
+fn toggle_favourite(favourites: &mut Vec<String>, name: &str) {
+    let Some(path) = favourites_path() else {
+        return;
+    };
+    match favourites.iter().position(|n| n == name) {
+        Some(idx) => {
+            favourites.remove(idx);
+        }
+        None => favourites.push(name.to_string()),
+    }
+    let mut content = favourites.join("\n");
+    content.push('\n');
+    let _ = std::fs::write(path, content);
+}
+
 pub fn run(args: &Args, init_list: &[String]) -> io::Result<()> {
     let terminal_guard = TerminalGuard::new()?;
 
+    let favourites = favourite_names();
     let list = if init_list.is_empty() {
-        if let Ok(v) = std::env::var("RECOL_FAVOURITES_FILE") {
-            let path = std::path::PathBuf::from(v);
-            if path.is_file() {
-                let content = std::fs::read_to_string(&path)?;
-                let mut c = lib::Collection::new();
-                let filters = args.theme_filters();
-                content
-                    .trim()
-                    .lines()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .filter_map(|l| {
-                        c.find(|t| t.name == l)
-                            .or(c.fuzzy_search(l, &filters, None))
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                lib::Collection::new().collect()
-            }
-        } else {
-            lib::Collection::new().collect()
+        match &favourites {
+            Some(names) => resolve_names(names, args),
+            None => lib::Collection::new().collect(),
         }
     } else {
         lib::Collection::new()
@@ -678,6 +724,7 @@ pub fn run(args: &Args, init_list: &[String]) -> io::Result<()> {
         list: list,
         scrolloff: DEFAULT_SCROLLOFF,
         current_theme: state::read_theme_history(1).first().cloned(),
+        favourites: favourites.unwrap_or_default(),
         adjust: args.adjust.clone(),
         ..Default::default()
     };
@@ -798,6 +845,17 @@ pub fn run(args: &Args, init_list: &[String]) -> io::Result<()> {
                             s.reset_pos();
                             s.filter_list_by_input();
                         };
+                    }
+                    (event::KeyCode::Char('m'), Mode::Normal) => {
+                        if let Some(theme) = s.list.get(s.list_index) {
+                            toggle_favourite(&mut s.favourites, theme.name);
+                        }
+                    }
+                    (event::KeyCode::Char('F'), Mode::Normal) => {
+                        if !s.favourites.is_empty() {
+                            s.list = resolve_names(&s.favourites, args);
+                            s.reset_pos();
+                        }
                     }
                     (event::KeyCode::Char('h'), Mode::Normal) => {
                         let history = state::read_theme_history(state::THEME_HISTORY_CAP);
